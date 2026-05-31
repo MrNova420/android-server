@@ -67,7 +67,26 @@ log "Created $PHONESRV"
 # ============================================================
 echo -e "\n${CYAN}═══ STEP 3: Configuring SSH ═══${NC}"
 
-SSHD_CONFIG="$PREFIX/etc/ssh/sshd_config"
+# Ensure openssh is installed first
+pkg install -y openssh 2>/dev/null || true
+
+# Find sshd_config - try common paths
+SSHD_CONFIG=""
+for path in "$PREFIX/etc/ssh/sshd_config" "$PREFIX/etc/sshd_config" "/data/data/com.termux/files/usr/etc/ssh/sshd_config"; do
+    if [ -f "$path" ]; then
+        SSHD_CONFIG="$path"
+        break
+    fi
+done
+
+# If not found, create it in the standard location
+if [ -z "$SSHD_CONFIG" ]; then
+    SSHD_CONFIG="$PREFIX/etc/ssh/sshd_config"
+    mkdir -p "$(dirname "$SSHD_CONFIG")"
+    info "Creating sshd_config at $SSHD_CONFIG"
+fi
+
+# Backup existing config
 cp "$SSHD_CONFIG" "$SSHD_CONFIG.bak" 2>/dev/null || true
 
 cat > "$SSHD_CONFIG" << 'SSHEOF'
@@ -79,7 +98,6 @@ ListenAddress 0.0.0.0
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitRootLogin no
-AuthenticationMethods publickey
 
 # Security
 X11Forwarding no
@@ -100,7 +118,7 @@ PrintLastLog yes
 TCPKeepAlive yes
 SSHEOF
 
-log "SSH configured (port 8022, key-only auth)"
+log "SSH configured at $SSHD_CONFIG (port 8022, key-only auth)"
 info "Set a password with 'passwd' (for emergency access only)"
 
 # ============================================================
@@ -108,8 +126,15 @@ info "Set a password with 'passwd' (for emergency access only)"
 # ============================================================
 echo -e "\n${CYAN}═══ STEP 4: Enabling Service Manager ═══${NC}"
 
-sv-enable sshd
-sv up sshd
+# Ensure termux-services is installed
+pkg install -y termux-services 2>/dev/null || true
+
+# Start sshd directly first (in case sv isn't ready)
+sshd 2>/dev/null || true
+
+# Then enable via service manager
+sv-enable sshd 2>/dev/null || true
+sv up sshd 2>/dev/null || true
 log "sshd service enabled"
 
 # ============================================================
@@ -153,8 +178,8 @@ else
   warn "Server files not found - run setup from the project directory"
 fi
 
-# Create phoned systemd-style service
-mkdir -p "$PREFIX/var/service/phoned/log"
+# Create phoned runit service
+mkdir -p "$PREFIX/var/service/phoned/log" 2>/dev/null || true
 ln -sf "$PREFIX/share/termux-services/svlogger" "$PREFIX/var/service/phoned/log/run" 2>/dev/null || true
 
 cat > "$PREFIX/var/service/phoned/run" << 'SVCEOF'
@@ -164,7 +189,7 @@ exec python server.py
 SVCEOF
 chmod +x "$PREFIX/var/service/phoned/run"
 
-sv-enable phoned
+sv-enable phoned 2>/dev/null || true
 log "phoned server installed"
 
 # ============================================================
@@ -406,17 +431,23 @@ echo -e "\n${GREEN}╔═══════════════════�
 echo -e "║           SETUP COMPLETE!                        ║"
 echo -e "╚══════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${YELLOW}Next steps:${NC}"
+echo -e "${YELLOW}Quick Start:${NC}"
 echo "  1. Set a password:  ${GREEN}passwd${NC}"
 echo "  2. Add your laptop SSH key:"
 echo "     ${GREEN}echo 'ssh-ed25519 AAAA... your@email.com' >> ~/.ssh/authorized_keys${NC}"
-echo "  3. Note your username:  ${GREEN}whoami${NC}"
-echo "  4. Note your IP:  ${GREEN}ip addr show wlan0 | grep inet${NC}"
-echo "  5. Connect from laptop:  ${GREEN}ssh -p 8022 <username>@<ip>${NC}"
-echo "  6. Start phoned:  ${GREEN}sv up phoned${NC}"
-echo "  7. Check status:  ${GREEN}sysinfo${NC}"
+echo "  3. Start SSH:       ${GREEN}sshd${NC}"
+echo "  4. Note username:   ${GREEN}whoami${NC}"
+echo "  5. Note IP:         ${GREEN}ip addr show wlan0 | grep inet${NC}"
+echo "  6. Start phoned:    ${GREEN}cd ~/.phonesrv && python server.py &${NC}"
 echo ""
-echo -e "${PURPLE}Commands:${NC}"
+echo -e "${YELLOW}From your laptop:${NC}"
+echo "  ${GREEN}ssh -p 8022 <username>@<ip>${NC}"
+echo ""
+echo -e "${YELLOW}If sshd service doesn't start automatically:${NC}"
+echo "  ${GREEN}sshd${NC}                    # Start manually"
+echo "  ${GREEN}pgrep sshd${NC}              # Verify it's running"
+echo ""
+echo -e "${YELLOW}Commands on phone:${NC}"
 echo "  sysinfo       - System status"
 echo "  anon on/off   - Anonymous mode"
 echo "  tunnel start  - Start Cloudflare tunnel"

@@ -1,0 +1,26 @@
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+.env
+
+# Logs
+*.log
+logs/
+
+# Config (contains secrets)
+.phoned/config.json
+.cloudflared/*.json
+.tor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

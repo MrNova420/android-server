@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""
+phoned - Phone Server CLI Client
+Full remote control of your Android phone server.
+Makes it feel like a real VPS from your laptop.
+"""
+import os
+import sys
+import json
+import subprocess
+import argparse
+import shutil
+import signal
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("[!] pip install requests")
+    sys.exit(1)
+
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".phoned"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DEFAULT_CONFIG = {
+    "ssh_host": "phone",
+    "ssh_port": 8022,
+    "ssh_user": "",
+    "ssh_key": "",
+    "api_host": "localhost",
+    "api_port": 5000,
+    "tunnel_host": "",
+    "tunnel_port": 22,
+}
+
+BANNER = """
+\033[35m╔══════════════════════════════════════════════════╗
+║         PHONED - Phone Server CLI                ║
+║       Your Android VPS, anywhere                 ║
+╚══════════════════════════════════════════════════╝\033[0m
+"""
+
+
+def load_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return DEFAULT_CONFIG
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def api(endpoint, method="GET", data=None):
+    """Call the phoned API via SSH tunnel or direct."""
+    config = load_config()
+    # Build URL
+    base = f"http://{config['api_host']}:{config['api_port']}"
+    url = f"{base}{endpoint}"
+
+    try:
+        if method == "GET":
+            r = requests.get(url, timeout=15)
+        elif method == "POST":
+            r = requests.post(url, json=data, timeout=15)
+        elif method == "DELETE":
+            r = requests.delete(url, timeout=15)
+        else:
+            r = requests.get(url, timeout=15)
+        return r.json()
+    except requests.ConnectionError:
+        # Fallback: try via SSH
+        return api_via_ssh(endpoint, method, data)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def api_via_ssh(endpoint, method="GET", data=None):
+    """Fallback API call via SSH if direct connection fails."""
+    config = load_config()
+    cmd_parts = ["curl", "-s"]
+
+    if method == "POST" and data:
+        cmd_parts.extend(["-X", "POST", "-H", "'Content-Type: application/json'",
+                          "-d", f"'{json.dumps(data)}'"])
+    elif method == "DELETE":
+        cmd_parts.append("-X DELETE")
+
+    cmd_parts.append(f"'http://localhost:{config['api_port']}{endpoint}'")
+
+    result = ssh_cmd(" ".join(cmd_parts))
+    try:
+        return json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        return {"output": result}
+
+
+def ssh_cmd(cmd=None, interactive=False):
+    """Execute SSH command or open interactive session."""
+    config = load_config()
+    host = config["ssh_host"]
+    port = config["ssh_port"]
+    user = config["ssh_user"]
+    key = config.get("ssh_key", "")
+
+    ssh_args = ["ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                "-p", str(port)]
+    if key:
+        ssh_args.extend(["-i", key])
+
+    ssh_args.append(f"{user}@{host}")
+
+    if interactive:
+        return subprocess.run(ssh_args).returncode
+    elif cmd:
+        ssh_args.append(cmd)
+        result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 and result.stderr:
+            return result.stderr.strip()
+        return result.stdout.strip()
+    return ""
+
+
+def scp_cmd(local_path, remote_path, upload=True):
+    """SCP file to/from phone."""
+    config = load_config()
+    host = config["ssh_host"]
+    port = config["ssh_port"]
+    user = config["ssh_user"]
+    key = config.get("ssh_key", "")
+
+    args = ["scp", "-P", str(port), "-o", "StrictHostKeyChecking=no"]
+    if key:
+        args.extend(["-i", key])
+
+    if upload:
+        args.extend([local_path, f"{user}@{host}:{remote_path}"])
+    else:
+        args.extend([f"{user}@{host}:{remote_path}", local_path])
+
+    return subprocess.run(args).returncode
+
+
+def rsync_cmd(local_path, remote_path, upload=True):
+    """Rsync directory to/from phone."""
+    config = load_config()
+    host = config["ssh_host"]
+    port = config["ssh_port"]
+    user = config["ssh_user"]
+    key = config.get("ssh_key", "")
+
+    remote = f"{user}@{host}:{remote_path}"
+    args = ["rsync", "-avzP", "--delete", "-e", f"ssh -p {port} -o StrictHostKeyChecking=no"]
+    if key:
+        args[4] += f" -i {key}"
+
+    if upload:
+        args.extend([local_path, remote])
+    else:
+        args.extend([remote, local_path])
+
+    return subprocess.run(args).returncode
+
+
+def print_json(data, indent=2):
+    """Pretty print JSON with colors."""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, bool):
+                color = "\033[32m" if v else "\033[31m"
+                sym = "yes" if v else "no"
+                print(f"  {k:20s} {color}{sym}\033[0m")
+            elif isinstance(v, dict):
+                print(f"\n  \033[36m{k}:\033[0m")
+                for sk, sv in v.items():
+                    print(f"    {sk:18s} {sv}")
+            else:
+                print(f"  {k:20s} {v}")
+    else:
+        print(json.dumps(data, indent=indent))
+
+
+# ──────────────────────────────────────────────
+# COMMANDS
+# ──────────────────────────────────────────────
+
+def cmd_init(args):
+    """Interactive setup wizard."""
+    print(BANNER)
+    print("  Let's configure your phone server connection.\n")
+
+    config = load_config()
+
+    val = input(f"  SSH username [whoami on phone] [{config.get('ssh_user', '')}]: ").strip()
+    if val:
+        config["ssh_user"] = val
+
+    val = input(f"  SSH key path [{config.get('ssh_key', '~/.ssh/phone_key')}]: ").strip()
+    if val:
+        config["ssh_key"] = os.path.expanduser(val)
+
+    val = input(f"  SSH hostname/IP [{config.get('ssh_host', 'phone')}]: ").strip()
+    if val:
+        config["ssh_host"] = val
+
+    val = input(f"  SSH port [{config.get('ssh_port', 8022)}]: ").strip()
+    if val:
+        config["ssh_port"] = int(val)
+
+    val = input(f"  Cloudflare tunnel hostname (blank=none) [{config.get('tunnel_host', '')}]: ").strip()
+    if val:
+        config["tunnel_host"] = val
+
+    # Test connection
+    print("\n  Testing SSH connection...")
+    save_config(config)
+    result = ssh_cmd("echo 'connected'")
+    if "connected" in str(result):
+        print("  \033[32m[+] Connection successful!\033[0m")
+    else:
+        print(f"  \033[33m[!] Could not connect: {result}\033[0m")
+        print("  Make sure SSH keys are set up. Run:")
+        print("    bash scripts/setup-ssh-keys.sh")
+
+    print(f"\n  Config saved: {CONFIG_FILE}")
+
+
+def cmd_status(args):
+    """Show phone server status."""
+    data = api("/status")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+        return
+
+    print(f"\n  \033[36m{'PHONE SERVER STATUS':^40}\033[0m\n")
+    print(f"  Uptime:      {data.get('uptime', 'N/A')}")
+
+    cpu = data.get("cpu", {})
+    pct = cpu.get("percent", 0)
+    color = "\033[32m" if pct < 70 else "\033[33m" if pct < 90 else "\033[31m"
+    print(f"  CPU:         {color}{pct}%\033[0m ({cpu.get('cores', '?')} cores)")
+    load = cpu.get("load", {})
+    print(f"  Load:        {load.get('1m', 0)} / {load.get('5m', 0)} / {load.get('15m', 0)}")
+
+    mem = data.get("memory", {})
+    pct = mem.get("percent", 0)
+    color = "\033[32m" if pct < 70 else "\033[33m" if pct < 90 else "\033[31m"
+    print(f"  Memory:      {color}{pct}%\033[0m ({mem.get('used_mb', 0)}MB / {mem.get('total_mb', 0)}MB)")
+
+    disk = data.get("disk", {})
+    pct = disk.get("percent", 0)
+    color = "\033[32m" if pct < 80 else "\033[33m" if pct < 95 else "\033[31m"
+    print(f"  Disk:        {color}{pct}%\033[0m ({disk.get('used_gb', 0)}GB / {disk.get('total_gb', 0)}GB)")
+
+    bat = data.get("battery", {})
+    bat_pct = bat.get("percentage", -1)
+    color = "\033[32m" if bat_pct > 30 else "\033[33m" if bat_pct > 15 else "\033[31m"
+    print(f"  Battery:     {color}{bat_pct}%\033[0m ({bat.get('status', 'unknown')})")
+    print(f"  Temperature: {bat.get('temperature', 'N/A')}°C")
+    print()
+
+
+def cmd_ssh(args):
+    """Open SSH session (interactive)."""
+    config = load_config()
+    host = config["ssh_host"]
+    port = config["ssh_port"]
+    user = config["ssh_user"]
+    key = config.get("ssh_key", "")
+
+    ssh_args = ["ssh", "-o", "StrictHostKeyChecking=no", "-p", str(port)]
+    if key:
+        ssh_args.extend(["-i", key])
+    ssh_args.append(f"{user}@{host}")
+
+    sys.exit(subprocess.run(ssh_args).returncode)
+
+
+def cmd_run(args):
+    """Execute command on phone."""
+    result = ssh_cmd(args.cmd)
+    print(result)
+
+
+def cmd_deploy(args):
+    """Deploy a project to the phone."""
+    local_path = Path(args.path).resolve()
+    if not local_path.exists():
+        print(f"\033[31m[!]\033[0m Not found: {local_path}")
+        return
+
+    name = args.name or local_path.name
+    remote = f"~/projects/{name}/"
+
+    print(f"[*] Creating project on phone...")
+    api(f"/projects/{name}", method="POST")
+
+    if local_path.is_dir():
+        print(f"[*] Syncing {local_path} -> phone:{remote}")
+        rsync_cmd(str(local_path) + "/", remote)
+    else:
+        print(f"[*] Uploading {local_path.name} -> phone:{remote}")
+        scp_cmd(str(local_path), remote)
+
+    print(f"\033[32m[+]\033[0m Deployed '{name}'")
+    print(f"    Run on phone: cd ~/projects/{name} && pm2 start run.sh --name {name}")
+
+
+def cmd_services(args):
+    """List services."""
+    data = api("/services")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+        return
+
+    print(f"\n  {'SERVICE':20s} {'STATUS'}")
+    print(f"  {'─'*20} {'─'*20}")
+    for svc in data.get("services", []):
+        status = svc["status"]
+        if "run:" in status:
+            color = "\033[32m"
+            icon = "●"
+        elif "down:" in status:
+            color = "\033[31m"
+            icon = "○"
+        else:
+            color = "\033[33m"
+            icon = "◌"
+        print(f"  {icon} {svc['name']:18s} {color}{status}\033[0m")
+    print()
+
+
+def cmd_service(args):
+    """Control a service."""
+    action = args.action
+    name = args.name
+
+    if action == "status":
+        data = api(f"/services/{name}")
+    else:
+        data = api(f"/services/{name}/{action}", method="POST")
+
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+    elif action == "status":
+        print(f"{name}: {data.get('status', 'unknown')}")
+    else:
+        ok = data.get("ok", False)
+        sym = "\033[32m[+]\033[0m" if ok else "\033[31m[!]\033[0m"
+        print(f"{sym} {name}: {action}")
+
+
+def cmd_projects(args):
+    """List projects."""
+    data = api("/projects")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+        return
+
+    projects = data.get("projects", [])
+    if not projects:
+        print("  No projects. Deploy with: phoned deploy <path>")
+        return
+
+    print(f"\n  {'PROJECT':20s} {'STATUS':10s} {'SIZE':10s}")
+    print(f"  {'─'*20} {'─'*10} {'─'*10}")
+    for proj in projects:
+        status = "\033[32mrunning\033[0m" if proj.get("running") else "\033[31mstopped\033[0m"
+        size = f"{proj.get('size_mb', 0)}MB"
+        print(f"  {proj['name']:20s} {status:22s} {size}")
+    print()
+
+
+def cmd_logs(args):
+    """View logs."""
+    target = args.service or args.app
+    if not target:
+        print("Usage: phoned logs <service-or-app>")
+        return
+
+    if args.app:
+        data = api(f"/logs/app/{target}?lines={args.lines}")
+    else:
+        data = api(f"/logs/{target}?lines={args.lines}")
+
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+    else:
+        print(data.get("logs", "No logs"))
+
+
+def cmd_tunnel(args):
+    """Manage tunnel."""
+    action = args.action
+    if action == "status":
+        data = api("/tunnel/status")
+    else:
+        data = api(f"/tunnel/{action}", method="POST")
+
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+    else:
+        print_json(data)
+
+
+def cmd_anon(args):
+    """Anonymous mode."""
+    action = args.action
+    if action == "status":
+        data = api("/tor/status")
+        if "error" in data:
+            print(f"\033[31m[!]\033[0m {data['error']}")
+            return
+        running = data.get("running", False)
+        sym = "\033[32mON\033[0m" if running else "\033[31mOFF\033[0m"
+        print(f"  Tor:     {sym}")
+        print(f"  Tor IP:  {data.get('ip', 'N/A')}")
+        for onion in data.get("onion_services", []):
+            print(f"  Onion:   {onion}")
+    elif action == "ip":
+        data = api("/network")
+        print(f"  Tor IP: {data.get('tor_ip', 'N/A')}")
+    else:
+        data = api(f"/tor/{action}", method="POST")
+        if "error" in data:
+            print(f"\033[31m[!]\033[0m {data['error']}")
+        else:
+            print(f"\033[32m[+]\033[0m Tor {action}")
+
+
+def cmd_network(args):
+    """Network info."""
+    data = api("/network")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+        return
+
+    print(f"\n  {'NETWORK INFO':^40}\n")
+    print(f"  Local IP:   {data.get('local_ip', 'N/A')}")
+    print(f"  Public IP:  {data.get('public_ip', 'N/A')}")
+    print(f"  Tor IP:     {data.get('tor_ip', 'N/A')}")
+    print(f"  SSH Port:   {data.get('ssh_port', 8022)}")
+    print()
+
+
+def cmd_health(args):
+    """Health check."""
+    data = api("/maint/health")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+        return
+
+    healthy = data.get("healthy", False)
+    sym = "\033[32mHEALTHY\033[0m" if healthy else "\033[31mDEGRADED\033[0m"
+    print(f"\n  Health: {sym}\n")
+
+    for name, check in data.get("checks", {}).items():
+        if isinstance(check, dict):
+            running = check.get("running", check.get("online_processes", "?"))
+            warning = check.get("warning", False)
+            if warning:
+                warn_sym = " \033[33m[WARN]\033[0m"
+            elif running is True or (isinstance(running, str) and running):
+                warn_sym = " \033[32m[OK]\033[0m"
+            else:
+                warn_sym = " \033[31m[FAIL]\033[0m"
+            print(f"  {name:15s}  {running}{warn_sym}")
+    print()
+
+
+def cmd_device(args):
+    """Device control."""
+    action = args.action
+    if action == "battery":
+        data = api("/battery")
+        print_json(data)
+    elif action == "notify":
+        title = input("Title: ").strip()
+        msg = input("Message: ").strip()
+        api("/device/notification", "POST", {"title": title, "message": msg})
+        print("\033[32m[+]\033[0m Notification sent")
+    elif action == "vibrate":
+        api("/device/vibrate", "POST", 200)
+        print("\033[32m[+]\033[0m Vibrated")
+    elif action == "torch":
+        state = input("Torch on/off: ").strip().lower() == "on"
+        api("/device/torch", "POST", state)
+        print(f"\033[32m[+]\033[0m Torch {'on' if state else 'off'}")
+    elif action == "location":
+        data = api("/device/location")
+        if "latitude" in data:
+            print(f"  Lat: {data['latitude']}, Lon: {data['longitude']}")
+            print(f"  Maps: https://maps.google.com/?q={data['latitude']},{data['longitude']}")
+        else:
+            print_json(data)
+    elif action == "clipboard":
+        data = api("/device/clipboard")
+        print(f"  Clipboard: {data.get('content', 'empty')}")
+
+
+def cmd_files(args):
+    """File management."""
+    action = args.action
+    if action == "list":
+        path = args.path or "~"
+        data = api(f"/files/list?path={path}")
+        if "listing" in data:
+            print(data["listing"])
+    elif action == "read":
+        if not args.path:
+            print("Usage: phoned files read <path>")
+            return
+        data = api(f"/files/read?path={args.path}")
+        if "content" in data:
+            print(data["content"])
+        else:
+            print(f"\033[31m[!]\033[0m {data.get('error', 'Not found')}")
+    elif action == "download":
+        if not args.path:
+            print("Usage: phoned files download <remote-path> [local-path]")
+            return
+        local = args.local or Path(args.path).name
+        scp_cmd(str(local), args.path, upload=False)
+        print(f"\033[32m[+]\033[0m Downloaded to {local}")
+    elif action == "upload":
+        if not args.path:
+            print("Usage: phoned files upload <local-path> [remote-path]")
+            return
+        remote = args.remote or f"~/"
+        scp_cmd(args.path, remote, upload=True)
+        print(f"\033[32m[+]\033[0m Uploaded to phone:{remote}")
+
+
+def cmd_update(args):
+    """Update packages."""
+    print("[*] Updating phone packages...")
+    data = api("/maint/update", method="POST")
+    if "error" in data:
+        print(f"\033[31m[!]\033[0m {data['error']}")
+    else:
+        print(data.get("output", "Update complete"))
+
+
+def cmd_reboot(args):
+    """Reboot phone."""
+    confirm = input("\033[33m[!] Reboot phone? (yes/no): \033[0m")
+    if confirm.lower() == "yes":
+        api("/maint/reboot", method="POST")
+        print("[+] Rebooting...")
+
+
+def cmd_ports(args):
+    """Port forwarding - expose phone ports locally."""
+    config = load_config()
+    host = config["ssh_host"]
+    port = config["ssh_port"]
+    user = config["ssh_user"]
+    key = config.get("ssh_key", "")
+
+    remote_port = args.remote_port
+    local_port = args.local_port or remote_port
+
+    ssh_args = ["ssh", "-o", "StrictHostKeyChecking=no",
+                "-N", "-L", f"{local_port}:localhost:{remote_port}",
+                "-p", str(port)]
+    if key:
+        ssh_args.extend(["-i", key])
+    ssh_args.append(f"{user}@{host}")
+
+    print(f"[*] Forwarding localhost:{local_port} -> phone:{remote_port}")
+    print("    Press Ctrl+C to stop\n")
+
+    try:
+        subprocess.run(ssh_args)
+    except KeyboardInterrupt:
+        print("\n[+] Port forward stopped")
+
+
+def cmd_sync(args):
+    """Sync a directory bidirectionally."""
+    local = Path(args.path).resolve()
+    remote = f"~/projects/{local.name}/"
+
+    if args.push:
+        print(f"[*] Pushing {local} -> phone:{remote}")
+        rsync_cmd(str(local) + "/", remote)
+    elif args.pull:
+        print(f"[*] Pulling phone:{remote} -> {local}")
+        local.mkdir(parents=True, exist_ok=True)
+        rsync_cmd(str(local) + "/", remote, upload=False)
+    else:
+        # Smart sync: push local changes
+        print(f"[*] Syncing {local} <-> phone:{remote}")
+        rsync_cmd(str(local) + "/", remote)
+
+    print("\033[32m[+]\033[0m Sync complete")
+
+
+def cmd_exec(args):
+    """Execute a script file on the phone."""
+    script = args.script
+    if not os.path.exists(script):
+        # Try as a command string
+        result = ssh_cmd(script)
+        print(result)
+        return
+
+    with open(script) as f:
+        content = f.read()
+
+    # Upload and execute
+    tmp = f"/tmp/phoned_exec_{os.getpid()}.sh"
+    ssh_cmd(f"echo '{content}' > {tmp} && chmod +x {tmp} && bash {tmp} && rm {tmp}")
+
+
+# ──────────────────────────────────────────────
+# MAIN CLI
+# ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="phoned",
+        description="Phone Server CLI - Full remote control of your Android VPS",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  phoned init                     Setup connection
+  phoned status                   Phone status
+  phoned ssh                      SSH session
+  phoned run "ls -la"             Remote command
+  phoned deploy ./myapp           Deploy project
+  phoned services                 List services
+  phoned service sshd restart     Restart service
+  phoned projects                 List projects
+  phoned logs sshd                View logs
+  phoned anon on                  Enable Tor
+  phoned anon rotate              New Tor IP
+  phoned ports 8080               Forward port 8080 locally
+  phoned sync ./myapp             Sync directory
+  phoned health                   Health check
+  phoned device battery           Battery info
+        """
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("init", help="Setup wizard")
+    sub.add_parser("status", help="Phone status")
+    sub.add_parser("ssh", help="SSH session")
+
+    p = sub.add_parser("run", help="Run remote command")
+    p.add_argument("cmd", help="Command")
+
+    sub.add_parser("services", help="List services")
+
+    p = sub.add_parser("service", help="Control service")
+    p.add_argument("name")
+    p.add_argument("action", choices=["status", "start", "stop", "restart"])
+
+    sub.add_parser("projects", help="List projects")
+
+    p = sub.add_parser("deploy", help="Deploy project")
+    p.add_argument("path", help="Local path")
+    p.add_argument("--name", help="Project name")
+
+    p = sub.add_parser("logs", help="View logs")
+    p.add_argument("service", nargs="?")
+    p.add_argument("--app", help="App logs")
+    p.add_argument("--lines", type=int, default=50)
+
+    p = sub.add_parser("tunnel", help="Tunnel management")
+    p.add_argument("action", choices=["status", "start", "stop"])
+
+    p = sub.add_parser("anon", help="Anonymous mode")
+    p.add_argument("action", choices=["status", "start", "stop", "rotate", "ip"])
+
+    sub.add_parser("network", help="Network info")
+    sub.add_parser("health", help="Health check")
+
+    p = sub.add_parser("device", help="Device control")
+    p.add_argument("action", choices=["battery", "notify", "vibrate", "torch", "location", "clipboard"])
+
+    p = sub.add_parser("files", help="File management")
+    p.add_argument("action", choices=["list", "read", "download", "upload"])
+    p.add_argument("path", nargs="?")
+    p.add_argument("--local", help="Local path for download")
+    p.add_argument("--remote", help="Remote path for upload")
+
+    sub.add_parser("update", help="Update packages")
+    sub.add_parser("reboot", help="Reboot phone")
+
+    p = sub.add_parser("ports", help="Port forwarding")
+    p.add_argument("remote_port", type=int, help="Phone port")
+    p.add_argument("local_port", nargs="?", type=int, help="Local port")
+
+    p = sub.add_parser("sync", help="Sync directory")
+    p.add_argument("path", help="Local directory")
+    p.add_argument("--push", action="store_true")
+    p.add_argument("--pull", action="store_true")
+
+    p = sub.add_parser("exec", help="Execute script on phone")
+    p.add_argument("script", help="Script file or command string")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        print(BANNER)
+        parser.print_help()
+        return
+
+    cmds = {
+        "init": cmd_init, "status": cmd_status, "ssh": cmd_ssh,
+        "run": cmd_run, "services": cmd_services, "service": cmd_service,
+        "projects": cmd_projects, "deploy": cmd_deploy, "logs": cmd_logs,
+        "tunnel": cmd_tunnel, "anon": cmd_anon, "network": cmd_network,
+        "health": cmd_health, "device": cmd_device, "files": cmd_files,
+        "update": cmd_update, "reboot": cmd_reboot, "ports": cmd_ports,
+        "sync": cmd_sync, "exec": cmd_exec,
+    }
+
+    func = cmds.get(args.command)
+    if func:
+        func(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,45 @@
+# Phone Server - SSH Config Template
+# Copy this to ~/.ssh/config on your LAPTOP
+
+# ═══════════════════════════════════════════════
+#  LAN ACCESS (phone and laptop on same WiFi)
+# ═══════════════════════════════════════════════
+Host phone
+    HostName 192.168.x.x          # Phone's local IP (check: ip addr show wlan0)
+    Port 8022
+    User u0_aXXX                  # Your Termux username (run: whoami)
+    IdentityFile ~/.ssh/phone_key
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# ═══════════════════════════════════════════════
+#  CLOUDFLARE TUNNEL ACCESS (from anywhere)
+# ═══════════════════════════════════════════════
+Host phone-cloud
+    HostName ssh.yourdomain.com   # Your Cloudflare tunnel hostname
+    User u0_aXXX
+    IdentityFile ~/.ssh/phone_key
+    ProxyCommand cloudflared access ssh --hostname ssh.yourdomain.com
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# ═══════════════════════════════════════════════
+#  TOR ACCESS (anonymous from anywhere)
+# ═══════════════════════════════════════════════
+# First get your .onion address from the phone:
+#   ssh phone "cat ~/.tor/services/ssh/hostname"
+#
+# Host phone-tor
+#     HostName abc123def456...onion.onion
+#     Port 22
+#     User u0_aXXX
+#     IdentityFile ~/.ssh/phone_key
+#     ProxyCommand nc -X 5 -x 127.0.0.1:9050 %h %p
+
+# ═══════════════════════════════════════════════
+#  QUICK CONNECT ALIASES
+# ═══════════════════════════════════════════════
+# After setting up above, you can just run:
+#   ssh phone          - LAN connection
+#   ssh phone-cloud    - Cloudflare tunnel
+#   ssh phone-tor      - Tor hidden service

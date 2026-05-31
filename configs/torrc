@@ -1,0 +1,48 @@
+# Tor Configuration for Phone Server
+# Edit this and copy to ~/.tor/torrc on the phone
+
+# SOCKS proxy port
+SocksPort 9050
+
+# Control port (for IP rotation)
+ControlPort 9051
+CookieAuthentication 1
+# Generate with: tor --hash-password "yourpassword"
+# HashedControlPassword <hash>
+
+# Logging
+Log notice file /data/data/com.termux/files/home/.phonesrv/logs/tor.log
+
+# ─── Hidden Services ───
+
+# SSH Hidden Service
+HiddenServiceDir /data/data/com.termux/files/home/.tor/services/ssh/
+HiddenServicePort 22 127.0.0.1:8022
+
+# Web Server Hidden Service
+HiddenServiceDir /data/data/com.termux/files/home/.tor/services/web/
+HiddenServicePort 80 127.0.0.1:8080
+HiddenServicePort 443 127.0.0.1:8443
+
+# API Hidden Service
+HiddenServiceDir /data/data/com.termux/files/home/.tor/services/api/
+HiddenServicePort 5000 127.0.0.1:5000
+
+# ─── Security ───
+
+# Don't reveal connected clients
+HiddenServiceSingleHopMode 0
+
+# Use entry guards
+UseEntryGuards 1
+
+# Circuit build timeout
+CircuitBuildTimeout 60
+KeepAlivePeriod 60
+
+# No DNS leaks
+DNSPort 0
+
+# Restrict exit nodes (optional - uncomment to use specific countries)
+# ExitNodes {us},{de},{nl}
+# StrictNodes 1

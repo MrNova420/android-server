@@ -1,0 +1,41 @@
+# Cloudflare Tunnel Configuration
+# Copy to ~/.cloudflared/config.yml on the phone
+#
+# Setup:
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create phone-server
+#   3. cloudflared tunnel route dns phone-server ssh.yourdomain.com
+#   4. Update TUNNEL_ID and credentials-file below
+
+# Replace with your tunnel UUID
+tunnel: YOUR_TUNNEL_ID_HERE
+
+# Path to credentials (update UUID in filename)
+credentials-file: /data/data/com.termux/files/home/.cloudflared/YOUR_TUNNEL_ID_HERE.json
+
+# Ingress rules - map hostnames to local services
+ingress:
+  # SSH access
+  - hostname: ssh.yourdomain.com
+    service: ssh://localhost:8022
+    originRequest:
+      noTLSVerify: false
+
+  # API access
+  - hostname: api.yourdomain.com
+    service: http://localhost:5000
+    originRequest:
+      noTLSVerify: false
+
+  # Web server access
+  - hostname: web.yourdomain.com
+    service: http://localhost:8080
+      originRequest:
+        noTLSVerify: false
+
+  # Dashboard (optional)
+  - hostname: dash.yourdomain.com
+    service: http://localhost:8090
+
+  # Catch-all
+  - service: http_status:404

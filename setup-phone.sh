@@ -1,432 +1,326 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# PHONE SERVER - Full Bootstrap Script
+# PHONE SERVER - Production Bootstrap
 # Run this ON YOUR PHONE in Termux
 # ============================================================
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-BANNER="""
-${PURPLE}╔══════════════════════════════════════════════════╗
-║         PHONE SERVER - SETUP WIZARD              ║
-║     Turn your Android into a private server      ║
-╚══════════════════════════════════════════════════╝${NC}
-"""
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; NC='\033[0m'
 
 log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[x]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
+fail() { echo -e "${RED}[x]${NC} $1"; }
 
-echo -e "$BANNER"
-
-# ============================================================
-# STEP 1: System Update & Packages
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 1: Installing Packages ═══${NC}"
-
-log "Updating package repos..."
-pkg update -y
-pkg upgrade -y || true
-
-log "Installing core packages..."
-pkg install -y openssh || true
-pkg install -y tmux || true
-pkg install -y curl wget git || true
-pkg install -y python || true
-pkg install -y termux-services || true
-pkg install -y termux-api || true
-pkg install -y jq htop nano vim rsync socat || true
-pkg install -y net-tools zip unzip tree || true
-
-log "Installing optional..."
-pkg install -y nodejs npm || true
-pkg install -y nginx privoxy tor || true
-
-log "Installing Python packages..."
-# Termux handles pip differently - no --break-system-packages needed
-pip install --upgrade pip 2>/dev/null || \
-pip3 install --upgrade pip 2>/dev/null || true
-
-pip install fastapi uvicorn psutil requests 2>/dev/null || \
-pip3 install fastapi uvicorn psutil requests 2>/dev/null || {
-    warn "pip failed - installing via pkg instead"
-    pkg install -y python-pip || true
-    pip install fastapi uvicorn psutil requests || true
-}
-
-log "Packages installed"
-
-# ============================================================
-# STEP 2: Directories
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 2: Creating Directory Structure ═══${NC}"
+echo -e "${PURPLE}"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║         PHONE SERVER - SETUP                    ║"
+echo "╚══════════════════════════════════════════════════╝"
+echo -e "${NC}"
 
 PHONESRV="$HOME/.phonesrv"
-mkdir -p "$PHONESRV"/{bin,config,logs,projects,scripts}
-mkdir -p "$PHONESRV/config/ssh"
+SSH_PORT=8022
+API_PORT=5000
+API_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+echo -e "${BLUE}═══ Installing packages ═══${NC}"
+
+pkg update -y 2>/dev/null
+pkg upgrade -y 2>/dev/null
+
+# Core packages - one at a time for reliability
+for pkg in openssh python curl wget git jq htop tmux termux-services termux-api; do
+    pkg install -y "$pkg" 2>/dev/null || warn "Failed: $pkg"
+done
+
+# Python packages - Termux compatible method
+echo "[*] Installing Python packages..."
+# Try pip directly first (works on most Termux versions)
+python -m pip install --upgrade pip 2>/dev/null || true
+python -m pip install fastapi uvicorn psutil requests 2>/dev/null && {
+    log "Python packages installed via pip"
+} || {
+    # Fallback: try pip3
+    python3 -m pip install --upgrade pip 2>/dev/null || true
+    python3 -m pip install fastapi uvicorn psutil requests 2>/dev/null && {
+        log "Python packages installed via pip3"
+    } || {
+        # Fallback: install via pkg
+        warn "pip failed, using pkg fallback"
+        for py in python-fastapi python-uvicorn python-psutil python-requests; do
+            pkg install -y "$py" 2>/dev/null || true
+        done
+    }
+}
+
+# Verify Python packages
+python -c "import fastapi; import uvicorn; import psutil; import requests" 2>/dev/null && {
+    log "Python packages verified"
+} || {
+    warn "Some Python packages missing - server may not start"
+}
+
+# ============================================================
+# 2. DIRECTORIES
+# ============================================================
+echo -e "\n${BLUE}═══ Creating directories ═══${NC}"
+
+mkdir -p "$PHONESRV"/{bin,config,logs,projects}
 mkdir -p "$HOME/.termux/boot"
 mkdir -p "$HOME/.ssh"
-mkdir -p "$HOME/bin"
-log "Created $PHONESRV"
+chmod 700 "$HOME/.ssh"
+log "Directories created"
 
 # ============================================================
-# STEP 3: SSH Setup (handle conflicts)
+# 3. SSH (rock-solid)
 # ============================================================
-echo -e "\n${CYAN}═══ STEP 3: Configuring SSH ═══${NC}"
+echo -e "\n${BLUE}═══ Setting up SSH ═══${NC}"
 
-# Kill any existing sshd first
-pkill sshd 2>/dev/null || true
-sleep 1
+# Kill any existing sshd
+pkill sshd 2>/dev/null; sleep 1
 
-# Find or create sshd_config
+# Ensure openssh is installed
+pkg install -y openssh 2>/dev/null
+
+# Generate host keys if missing
+ssh-keygen -A 2>/dev/null
+
+# Find sshd_config
 SSHD_CONFIG="$PREFIX/etc/ssh/sshd_config"
 if [ ! -f "$SSHD_CONFIG" ]; then
     mkdir -p "$(dirname "$SSHD_CONFIG")"
-    info "Creating $SSHD_CONFIG"
-fi
-
-# Backup and write new config
-cp "$SSHD_CONFIG" "$SSHD_CONFIG.bak" 2>/dev/null || true
-
-cat > "$SSHD_CONFIG" << 'SSHEOF'
+    # Create minimal config
+    cat > "$SSHD_CONFIG" << 'EOF'
 Port 8022
 AddressFamily any
 ListenAddress 0.0.0.0
-
 PubkeyAuthentication yes
 PasswordAuthentication yes
 PermitRootLogin no
-
 X11Forwarding no
 AllowTcpForwarding yes
 MaxAuthTries 3
 MaxSessions 5
 ClientAliveInterval 60
 ClientAliveCountMax 3
-
 PrintMotd no
 PrintLastLog yes
 TCPKeepAlive yes
-SSHEOF
+EOF
+    log "Created sshd_config"
+else
+    # Patch existing config for our settings
+    sed -i 's/^#\?Port .*/Port 8022/' "$SSHD_CONFIG"
+    sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+    sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
+    log "Patched existing sshd_config"
+fi
 
-# Set a default password (user should change it)
-echo "Setting default password to 'phone' - change it with passwd"
-echo "phone:phone" | chpasswd 2>/dev/null || {
-    # If chpasswd not available, use termux way
-    echo "Set password manually with: passwd"
+# Set password
+echo "Setting password to 'phone' (change with: passwd)"
+echo "phone:phone" | chpasswd 2>/dev/null || echo "phone" | passwd --stdin "$(whoami)" 2>/dev/null || {
+    # Manual password set
+    echo "Set password manually: passwd"
 }
 
-# Generate host keys if missing
-ssh-keygen -A 2>/dev/null || true
-
 # Start sshd
-log "Starting sshd..."
 sshd 2>/dev/null
-
-# Verify
 sleep 1
+
+# Verify sshd is running
 if pgrep sshd > /dev/null 2>&1; then
-    log "sshd is running on port 8022"
+    log "sshd running on port $SSH_PORT"
 else
-    warn "sshd didn't start, trying alternative..."
-    # Try without config
+    warn "sshd failed to start with config, trying without..."
     sshd -D &
     sleep 1
     if pgrep sshd > /dev/null 2>&1; then
-        log "sshd started (alternative mode)"
+        log "sshd started (fallback mode)"
     else
-        err "sshd failed to start - try running: sshd -d"
+        fail "CRITICAL: sshd failed. Try: sshd -d (debug mode)"
     fi
 fi
 
-info "SSH user: $(whoami)"
-info "SSH port: 8022"
+# ============================================================
+# 4. API TOKEN (save for client)
+# ============================================================
+echo -e "\n${BLUE}═══ Generating API token ═══${NC}"
+
+mkdir -p "$PHONESRV/config"
+cat > "$PHONESRV/config/token" << EOF
+$API_TOKEN
+EOF
+chmod 600 "$PHONESRV/config/token"
+log "API token saved"
 
 # ============================================================
-# STEP 4: Service Manager
+# 5. SERVER
 # ============================================================
-echo -e "\n${CYAN}═══ STEP 4: Enabling Service Manager ═══${NC}"
+echo -e "\n${BLUE}═══ Installing server ═══${NC}"
 
-sv-enable sshd 2>/dev/null || true
-sv up sshd 2>/dev/null || true
-log "Service manager configured"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Copy server files
+if [ -d "$SCRIPT_DIR/server" ]; then
+    cp "$SCRIPT_DIR/server/server.py" "$PHONESRV/"
+    cp "$SCRIPT_DIR/server/requirements.txt" "$PHONESRV/" 2>/dev/null || true
+    log "Server files copied"
+else
+    fail "server/ directory not found. Run from project root."
+fi
+
+# Create run script
+cat > "$PHONESRV/run-server.sh" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$HOME/.phonesrv"
+exec python server.py 2>&1 | tee -a logs/server.log
+EOF
+chmod +x "$PHONESRV/run-server.sh"
 
 # ============================================================
-# STEP 5: Boot Script
+# 6. BOOT SCRIPT
 # ============================================================
-echo -e "\n${CYAN}═══ STEP 5: Configuring Boot Persistence ═══${NC}"
+echo -e "\n${BLUE}═══ Setting up boot persistence ═══${NC}"
 
-cat > "$HOME/.termux/boot/start-server.sh" << 'BOOTEOF'
+cat > "$HOME/.termux/boot/start-server.sh" << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Keep CPU alive - critical for always-on
+# Keep CPU alive
 termux-wake-lock
 
-# Wait for WiFi to come up
+# Wait for network
 sleep 15
 
 # Source environment
-. $PREFIX/etc/profile
+. $PREFIX/etc/profile 2>/dev/null
 
 # Start sshd if not running
 if ! pgrep sshd > /dev/null 2>&1; then
     sshd
 fi
 
-# Start all runit services
-exec runsvdir -P $PREFIX/var/service &
-BOOTEOF
-chmod +x "$HOME/.termux/boot/start-server.sh"
-log "Boot script created"
-
-# ============================================================
-# STEP 6: phoned Server
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 6: Installing phoned Server ═══${NC}"
-
-# Copy server files
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -d "$SCRIPT_DIR/server" ]; then
-    cp -r "$SCRIPT_DIR/server/"* "$PHONESRV/"
-    log "Server files copied"
-else
-    warn "Server files not found - run from project directory"
+# Start phoned server
+cd $HOME/.phonesrv
+if [ -f server.py ]; then
+    nohup python server.py >> logs/server.log 2>&1 &
 fi
 
-# Create phoned service
-mkdir -p "$PREFIX/var/service/phoned/log" 2>/dev/null || true
-ln -sf "$PREFIX/share/termux-services/svlogger" "$PREFIX/var/service/phoned/log/run" 2>/dev/null || true
-
-cat > "$PREFIX/var/service/phoned/run" << 'SVCEOF'
-#!/bin/bash
-cd $HOME/.phonesrv
-exec python server.py
-SVCEOF
-chmod +x "$PREFIX/var/service/phoned/run"
-
-sv-enable phoned 2>/dev/null || true
-sv up phoned 2>/dev/null || true
-log "phoned server installed"
+# Start runit services (if configured)
+if command -v runsvdir > /dev/null 2>&1; then
+    exec runsvdir -P $PREFIX/var/service &
+fi
+EOF
+chmod +x "$HOME/.termux/boot/start-server.sh"
+log "Boot script installed"
 
 # ============================================================
-# STEP 7: Process Manager (pm2)
+# 7. HELPER SCRIPTS
 # ============================================================
-echo -e "\n${CYAN}═══ STEP 7: Installing Process Manager ═══${NC}"
+echo -e "\n${BLUE}═══ Installing helper scripts ═══${NC}"
 
-npm install -g pm2 2>/dev/null || true
-pm2 startup termux 2>/dev/null || true
-log "pm2 installed"
-
-# ============================================================
-# STEP 8: Shell Setup
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 8: Setting Up Shell ═══${NC}"
-
-cat >> "$HOME/.bashrc" << 'RCLOG'
-
-# === Phone Server Aliases ===
-export PHONESRV="$HOME/.phonesrv"
-export PATH="$HOME/.phonesrv/bin:$HOME/bin:$PATH"
-
-alias sysinfo='$HOME/.phonesrv/bin/sysinfo'
-alias ps-status='curl -s http://localhost:5000/status | jq'
-alias ps-services='curl -s http://localhost:5000/services | jq'
-alias ps-projects='ls -la ~/projects/'
-alias ps-logs='tail -f $HOME/.phonesrv/logs/*.log'
-alias ps-restart='sv restart phoned'
-alias ps-sshlog='tail -f $PREFIX/var/log/sv/sshd/current'
-
-deploy() {
-  if [ -z "$1" ]; then
-    echo "Usage: deploy <local-path>"
-    return 1
-  fi
-  rsync -avzP -e 'ssh -p 8022' "$1" "$(whoami)@localhost:~/projects/"
-}
-
-connect() {
-  ssh -p 8022 "$(whoami)@localhost"
-}
-RCLOG
-
-log "Shell aliases added"
-
-# ============================================================
-# STEP 9: Firewall (basic)
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 9: Basic Security ═══${NC}"
-
-cat > "$PHONESRV/bin/firewall.sh" << 'FWEOF'
+cat > "$PHONESRV/bin/sysinfo" << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-echo "[*] Applying basic firewall rules..."
-iptables -A INPUT -i lo -j ACCEPT 2>/dev/null
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-iptables -A INPUT -p tcp --dport 8022 -j ACCEPT 2>/dev/null
-iptables -A INPUT -p tcp --dport 5000 -s 127.0.0.1 -j ACCEPT 2>/dev/null
-iptables -A INPUT -p tcp --dport 8080 -s 127.0.0.1 -j ACCEPT 2>/dev/null
-echo "[+] Firewall rules applied"
-FWEOF
-chmod +x "$PHONESRV/bin/firewall.sh"
-log "Firewall script created"
-
-# ============================================================
-# STEP 10: Helper Scripts
-# ============================================================
-echo -e "\n${CYAN}═══ STEP 10: Creating Helper Scripts ═══${NC}"
-
-cat > "$PHONESRV/bin/sysinfo" << 'INFOEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-echo "═══════════════════════════════════════"
-echo "       PHONE SERVER STATUS"
-echo "═══════════════════════════════════════"
+echo "═══════════════════════════════════"
+echo "  PHONE SERVER STATUS"
+echo "═══════════════════════════════════"
 echo ""
-echo "📱 Device:"
-getprop ro.product.model 2>/dev/null || echo "  Unknown"
+echo "Device:    $(getprop ro.product.model 2>/dev/null || echo unknown)"
+echo "Uptime:    $(uptime -p 2>/dev/null || uptime)"
 echo ""
-echo "⏱️  Uptime:"
-uptime -p 2>/dev/null || uptime
+echo "CPU:       $(top -bn1 | head -3 | tail -1)"
 echo ""
-echo "💾 Memory:"
 free -h 2>/dev/null || cat /proc/meminfo | head -3
 echo ""
-echo "💿 Disk:"
 df -h /data 2>/dev/null || df -h ~
 echo ""
-echo "🔋 Battery:"
-termux-battery-status 2>/dev/null | jq -c '{percentage: .percentage, status: .status}' 2>/dev/null || echo "  N/A"
+echo "Battery:   $(termux-battery-status 2>/dev/null | jq -c '{pct:.percentage, status:.status}' 2>/dev/null || echo N/A)"
 echo ""
-echo "🌐 Network:"
-ip addr show wlan0 2>/dev/null | grep "inet " || echo "  No WiFi"
+echo "Network:   $(ip addr show wlan0 2>/dev/null | grep 'inet ' || echo 'No WiFi')"
 echo ""
-echo "📡 Services:"
-pgrep sshd > /dev/null && echo "  sshd:    running" || echo "  sshd:    stopped"
-pgrep -f "server.py" > /dev/null && echo "  phoned:  running" || echo "  phoned:  stopped"
+echo "SSH:       $(pgrep sshd > /dev/null && echo 'running' || echo 'STOPPED')"
+echo "phoned:    $(pgrep -f 'server.py' > /dev/null && echo 'running' || echo 'STOPPED')"
 echo ""
-echo "═══════════════════════════════════════"
-INFOEOF
+echo "═══════════════════════════════════"
+EOF
 chmod +x "$PHONESRV/bin/sysinfo"
 
-cat > "$PHONESRV/bin/tunnel" << 'TUNEOF'
+cat > "$PHONESRV/bin/start-sshd" << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-case "${1:-help}" in
-  start) sv up cloudflared 2>/dev/null || echo "Not configured" ;;
-  stop)  sv down cloudflared 2>/dev/null || echo "Not configured" ;;
-  status) sv status cloudflared 2>/dev/null || echo "Not configured" ;;
-  *) echo "Usage: tunnel {start|stop|status}" ;;
-esac
-TUNEOF
-chmod +x "$PHONESRV/bin/tunnel"
-
-cat > "$PHONESRV/bin/anon" << 'ANONEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-case "${1:-status}" in
-  on)
-    sv up tor 2>/dev/null && echo "[+] Tor started" || echo "[!] Tor not installed"
-    sv up privoxy 2>/dev/null && echo "[+] Privoxy started" || echo "[!] Privoxy not installed"
-    ;;
-  off)
-    sv down tor 2>/dev/null
-    sv down privoxy 2>/dev/null
-    echo "[+] Anonymous mode OFF"
-    ;;
-  rotate)
-    (echo 'AUTHENTICATE'; echo 'SIGNAL NEWNYM'; echo 'QUIT') | nc 127.0.0.1 9051 2>/dev/null
-    echo "[+] New circuit requested"
-    ;;
-  ip)
-    curl -s --socks5-hostname 127.0.0.1:9050 https://api.ipify.org 2>/dev/null || echo "Tor not running"
-    ;;
-  status)
-    pgrep tor > /dev/null && echo "Tor: running" || echo "Tor: stopped"
-    ;;
-  *) echo "Usage: anon {on|off|rotate|ip|status}" ;;
-esac
-ANONEOF
-chmod +x "$PHONESRV/bin/anon"
-
-cat > "$PHONESRV/bin/restart-all" << 'RESEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-echo "[*] Restarting all services..."
-pkill sshd 2>/dev/null; sleep 1; sshd && echo "[+] sshd" || echo "[!] sshd failed"
-sv restart phoned 2>/dev/null && echo "[+] phoned" || echo "[!] phoned"
-sv restart tor 2>/dev/null && echo "[+] tor" || echo "[!] tor skipped"
-sv restart nginx 2>/dev/null && echo "[+] nginx" || echo "[!] nginx skipped"
-sv restart cloudflared 2>/dev/null && echo "[+] cloudflared" || echo "[!] cloudflared skipped"
-echo "[+] Done"
-RESEOF
-chmod +x "$PHONESRV/bin/restart-all"
-
-cat > "$PHONESRV/bin/start-sshd" << 'SSHEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-pkill sshd 2>/dev/null
-sleep 1
-sshd
-if pgrep sshd > /dev/null 2>&1; then
-    echo "[+] sshd started on port 8022"
-else
-    echo "[!] sshd failed to start"
-fi
-SSHEOF
+pkill sshd 2>/dev/null; sleep 1
+sshd 2>/dev/null
+pgrep sshd > /dev/null 2>&1 && echo "[+] sshd started on port 8022" || echo "[!] sshd failed"
+EOF
 chmod +x "$PHONESRV/bin/start-sshd"
 
-# Add bin to PATH
-echo 'export PATH="$HOME/.phonesrv/bin:$HOME/bin:$PATH"' >> "$HOME/.bashrc"
-export PATH="$HOME/.phonesrv/bin:$HOME/bin:$PATH"
+cat > "$PHONESRV/bin/start-phoned" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+pkill -f 'server.py' 2>/dev/null; sleep 1
+cd $HOME/.phonesrv
+nohup python server.py >> logs/server.log 2>&1 &
+sleep 2
+pgrep -f 'server.py' > /dev/null 2>&1 && echo "[+] phoned started on port 5000" || echo "[!] phoned failed"
+EOF
+chmod +x "$PHONESRV/bin/start-phoned"
 
+cat > "$PHONESRV/bin/restart-all" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo "[*] Restarting..."
+pkill sshd 2>/dev/null; sleep 1; sshd 2>/dev/null && echo "[+] sshd" || echo "[!] sshd"
+pkill -f 'server.py' 2>/dev/null; sleep 1
+cd $HOME/.phonesrv && nohup python server.py >> logs/server.log 2>&1 &
+sleep 2 && pgrep -f 'server.py' > /dev/null 2>&1 && echo "[+] phoned" || echo "[!] phoned"
+EOF
+chmod +x "$PHONESRV/bin/restart-all"
+
+# Add to PATH
+echo 'export PATH="$HOME/.phonesrv/bin:$PATH"' >> "$HOME/.bashrc"
+export PATH="$HOME/.phonesrv/bin:$PATH"
 log "Helper scripts installed"
 
 # ============================================================
-# START EVERYTHING
+# 8. START EVERYTHING
 # ============================================================
-echo -e "\n${CYAN}═══ Starting Services ═══${NC}"
+echo -e "\n${BLUE}═══ Starting services ═══${NC}"
 
-# Make sure sshd is running
-if ! pgrep sshd > /dev/null 2>&1; then
-    sshd 2>/dev/null
-fi
+# Ensure sshd is running
+pgrep sshd > /dev/null 2>&1 || sshd 2>/dev/null
 
-# Start phoned server in background
+# Start phoned
 cd "$PHONESRV"
-nohup python server.py > logs/server.log 2>&1 &
+nohup python server.py >> logs/server.log 2>&1 &
 sleep 2
 
 if pgrep -f "server.py" > /dev/null 2>&1; then
-    log "phoned server started on port 5000"
+    log "phoned server running on port $API_PORT"
 else
-    warn "phoned server didn't start - check logs"
+    warn "phoned server failed to start - check: cat ~/.phonesrv/logs/server.log"
 fi
 
 # ============================================================
 # DONE
 # ============================================================
-echo -e "\n${GREEN}╔══════════════════════════════════════════════════╗"
-echo -e "║           SETUP COMPLETE!                        ║"
+IP=$(ip addr show wlan0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+USER=$(whoami)
+
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════╗"
+echo -e "║           SETUP COMPLETE                         ║"
 echo -e "╚══════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${YELLOW}Phone Info:${NC}"
-echo "  Username:  ${GREEN}$(whoami)${NC}"
-echo "  SSH Port:  ${GREEN}8022${NC}"
-IP=$(ip addr show wlan0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-echo "  Local IP:  ${GREEN}${IP:-check wifi settings}${NC}"
+echo -e "  SSH User:     ${GREEN}$USER${NC}"
+echo -e "  SSH Password: ${GREEN}phone${NC}  ${YELLOW}(change with: passwd)${NC}"
+echo -e "  SSH Port:     ${GREEN}$SSH_PORT${NC}"
+echo -e "  Local IP:     ${GREEN}${IP:-unknown}${NC}"
+echo -e "  API Token:    ${GREEN}$API_TOKEN${NC}"
 echo ""
-echo -e "${YELLOW}From your laptop:${NC}"
-echo "  ${GREEN}ssh -p 8022 $(whoami)@${IP:-<phone-ip>}${NC}"
+echo -e "  ${YELLOW}From laptop:${NC}"
+echo -e "  ${GREEN}ssh -p $SSH_PORT $USER@${IP:-<phone-ip>}${NC}"
 echo ""
-echo -e "${YELLOW}If SSH doesn't work, try:${NC}"
-echo "  ${GREEN}sshd${NC}            # Restart SSH"
-echo "  ${GREEN}passwd${NC}          # Set password"
-echo ""
-echo -e "${YELLOW}Quick commands:${NC}"
+echo -e "  ${YELLOW}Commands:${NC}"
 echo "  sysinfo        - System status"
-echo "  start-sshd     - Start SSH server"
-echo "  anon on/off    - Anonymous mode"
+echo "  start-sshd     - Restart SSH"
+echo "  start-phoned   - Restart server"
 echo "  restart-all    - Restart everything"
 echo ""
